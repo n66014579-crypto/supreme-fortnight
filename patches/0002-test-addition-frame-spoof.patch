@@ -1,0 +1,84 @@
+diff --git a/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/SiteIsolation.mm b/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/SiteIsolation.mm
+index 887d461b..2697fc88 100644
+--- a/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/SiteIsolation.mm
++++ b/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/SiteIsolation.mm
+@@ -2155,6 +2155,79 @@ TEST(SiteIsolation, IframeWithPrompt)
+     EXPECT_WK_STREQ(childFrame.info.securityOrigin.host, "webkit.org");
+ }
+ 
++// --- PoC test for Apple Security Research report OE11044060622355 ---
++// "WebKit WebPageProxy: cross-origin frame-identity spoofing via unauthenticated process IPC"
++//
++// WebPageProxy::runJavaScriptAlert (and its structurally identical siblings
++// runJavaScriptConfirm, runJavaScriptPrompt, runOpenPanel) resolve the IPC-supplied
++// FrameIdentifier via WebFrameProxy's global, connection-blind registry and check only that the
++// resolved frame belongs to the current page (WebPageProxy.cpp ~12166-12193) -- never that the
++// IPC message's actual sender (the real IPC::Connection/process it arrived on) owns that frame.
++// The one correct sibling, runBeforeUnloadConfirmPanel, additionally checks
++// `&frame->frameProcess().process() != webProcess.ptr()` (WebPageProxy.cpp ~13065-13070) and
++// bails out if the sender doesn't own the named frame -- the check the other four are missing.
++//
++// This test uses the disclosed, #if ENABLE(IPC_TESTING_API)-gated sender-side stand-in added to
++// WebChromeClient::runJavaScriptAlert (see patches/0001-*.patch) as a substitute for "the
++// cross-origin iframe's WebContent process is compromised and sends this exact real IPC message
++// with a forged frameID" -- which is what a genuine renderer memory-corruption exploit would let
++// a real attacker do. Everything downstream of the send -- WebPageProxy::runJavaScriptAlert,
++// API::FrameInfo::create/stateSnapshot, WKFrameInfo -- is completely stock, unmodified WebKit.
++//
++// frameInfo is deliberately left real/unforged (only frameID is substituted), so the dialog's
++// message and WKFrameInfo.securityOrigin still honestly show the real sender (the iframe,
++// webkit.org). But WKFrameInfo.isMainFrame and the private WKFrameInfo._processIdentifier are
++// derived by API::FrameInfo re-resolving the (forged) frameID through the global registry
++// (APIFrameInfo.cpp: FrameInfo::stateSnapshot), not from anything the sender legitimately
++// controls -- so they come back wrong, which is this test's assertion.
++TEST(SiteIsolation, FrameIdentitySpoofingPoC_AlertAttributedToFrameWhoseProcessDidNotSendMessage)
++{
++    HTTPServer server({
++        { "/example"_s, { "<iframe id='webkit_frame' src='https://webkit.org/webkit'></iframe>"_s } },
++        { "/webkit"_s, { "<script>alert('POC_FRAME_SPOOF:forged alert')</script>"_s } },
++    }, HTTPServer::Protocol::HttpsProxy);
++    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server);
++
++    __block bool receivedAlert = false;
++    __block RetainPtr<WKFrameInfo> capturedFrameInfo;
++    RetainPtr uiDelegate = adoptNS([TestUIDelegate new]);
++    uiDelegate.get().runJavaScriptAlertPanelWithMessage = ^(WKWebView *, NSString *, WKFrameInfo *frameInfo, void (^completionHandler)(void)) {
++        capturedFrameInfo = frameInfo;
++        receivedAlert = true;
++        completionHandler();
++    };
++    webView.get().UIDelegate = uiDelegate.get();
++
++    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/example"]]];
++    TestWebKitAPI::Util::run(&receivedAlert);
++
++    auto mainFrame = [webView mainFrame];
++    auto childFrame = mainFrame.childFrames.firstObject;
++    pid_t mainFramePid = mainFrame.info._processIdentifier;
++    pid_t childFramePid = childFrame.info._processIdentifier;
++    EXPECT_NE(mainFramePid, 0);
++    EXPECT_NE(childFramePid, 0);
++    EXPECT_NE(mainFramePid, childFramePid); // sanity: really two different WebContent processes
++
++    BOOL reportedIsMainFrame = capturedFrameInfo.get().isMainFrame;
++    pid_t reportedProcessIdentifier = capturedFrameInfo.get()._processIdentifier;
++    NSString *reportedOriginHost = capturedFrameInfo.get().securityOrigin.host;
++
++    NSLog(@"POC_RESULT reportedIsMainFrame=%d reportedProcessIdentifier=%d mainFramePid=%d childFramePid=%d reportedOriginHost=%@",
++        reportedIsMainFrame, reportedProcessIdentifier, mainFramePid, childFramePid, reportedOriginHost);
++
++    // frameInfo content was never touched -- the dialog honestly still says it came from the
++    // real sender, the cross-origin iframe:
++    EXPECT_WK_STREQ(reportedOriginHost, "webkit.org");
++
++    // But .isMainFrame and ._processIdentifier are WRONG: this alert was raised by the iframe
++    // (owned by childFramePid), yet the app-facing WKFrameInfo says it's the main frame, owned
++    // by the main frame's real process -- exactly the frame-identity spoof this report claims.
++    EXPECT_TRUE(reportedIsMainFrame);
++    EXPECT_EQ(reportedProcessIdentifier, mainFramePid);
++    EXPECT_NE(reportedProcessIdentifier, childFramePid);
++}
++
+ // Make sure the main frame remains responsive even while a cross origin iframe is
+ // displaying an alert.
+ TEST(SiteIsolation, MainFrameHeartbeatContinuesWhileCrossSiteIframeDialogShown)

